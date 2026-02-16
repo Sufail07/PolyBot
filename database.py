@@ -4,6 +4,7 @@ from sqlalchemy.ext.declarative import declarative_base
 import datetime
 import os
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.utils import HfHubHTTPError
 
 
 
@@ -11,12 +12,16 @@ from huggingface_hub import HfApi, hf_hub_download
 Base = declarative_base()
 
 DATABASE_URL = "sqlite:///./polymarket.db"
-REPO_ID = "Sufail07/PolyBot"
+# Must point to an existing HF dataset repo, e.g. "username/my-dataset-repo"
+REPO_ID = os.getenv("HF_DATASET_REPO_ID", "Sufail07/PolyBot")
 DB_NAME = "polymarket.db"
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 def download_db():
     """Downloads the database from the HF Dataset at startup"""
+    if not REPO_ID:
+        print("HF dataset sync disabled: HF_DATASET_REPO_ID is not set.")
+        return
     try:
         path = hf_hub_download(
             repo_id=REPO_ID,
@@ -27,12 +32,23 @@ def download_db():
         # Move the downloaded file to the current working directory
         import shutil
         shutil.copy(path, DB_NAME)
-        print("✅ Database synced from HF Dataset.")
+        print("Database synced from HF dataset.")
+    except HfHubHTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            print(
+                f"HF dataset repo not found: '{REPO_ID}'. "
+                "Starting with local DB. Set HF_DATASET_REPO_ID to a valid dataset repo."
+            )
+            return
+        print(f"HF dataset download failed: {e}")
     except Exception as e:
-        print(f"ℹ️ No existing database found in dataset, starting fresh. ({e})")
+        print(f"No existing database found in dataset, starting fresh. ({e})")
 
 def upload_db():
     """Uploads the current database to the HF Dataset"""
+    if not REPO_ID:
+        print("HF dataset upload skipped: HF_DATASET_REPO_ID is not set.")
+        return
     try:
         api = HfApi()
         api.upload_file(
@@ -42,9 +58,17 @@ def upload_db():
             repo_type="dataset",
             token=HF_TOKEN
         )
-        print("☁️ Database backed up to HF Dataset.")
+        print("Database backed up to HF dataset.")
+    except HfHubHTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            print(
+                f"HF dataset upload skipped: repo '{REPO_ID}' does not exist. "
+                "Create it first or set HF_DATASET_REPO_ID to the correct dataset repo."
+            )
+            return
+        print(f"Backup failed: {e}")
     except Exception as e:
-        print(f"❌ Backup failed: {e}")
+        print(f"Backup failed: {e}")
 
 
 class Market(Base):

@@ -30,6 +30,13 @@ class GearFilter(logging.Filter):
         record.gear = self.gear
         return True
 
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
 # Create two loggers, one for each gear
 formatter = logging.Formatter("%(asctime)s [%(gear)s] [%(levelname)s] - %(message)s")
 
@@ -57,13 +64,13 @@ sentry_logger.addHandler(file_handler)
 sentry_logger.addHandler(stream_handler)
 sentry_logger.propagate = False
 
-# Root logger for general info
-root_logger = logging.getLogger('root')
-root_logger.setLevel(logging.INFO)
-root_logger.addFilter(GearFilter('SYSTEM'))
-root_logger.addHandler(file_handler)
-root_logger.addHandler(stream_handler)
-root_logger.propagate = False
+# System logger for general info
+system_logger = logging.getLogger('system')
+system_logger.setLevel(logging.INFO)
+system_logger.addFilter(GearFilter('SYSTEM'))
+system_logger.addHandler(file_handler)
+system_logger.addHandler(stream_handler)
+system_logger.propagate = False
 
 # Social logger
 social_logger = logging.getLogger('social')
@@ -94,14 +101,14 @@ def fetch_single_market_data(market_id: str):
             POLIMARKET_SINGLE_MARKET_API_URL.format(market_id),
             timeout=20,
             max_retries=5,
-            logger=root_logger,
+            logger=system_logger,
         )
         return response.json()
     except json.JSONDecodeError as e:
-        root_logger.error(f"JSON Decode Error for market {market_id}: {e}")
+        system_logger.error(f"JSON Decode Error for market {market_id}: {e}")
         return None
     except Exception as e:
-        root_logger.error(f"API Error for market {market_id}: {e}")
+        system_logger.error(f"API Error for market {market_id}: {e}")
         return None
 
 
@@ -199,6 +206,8 @@ def run_sentry():
         all_live_markets = []
         limit = 200
         offset = 0
+        pages = 0
+        max_pages = max(1, int(os.getenv("SENTRY_MAX_PAGES", "40")))
         
         while True:
             sentry_logger.info(f"Fetching markets with offset={offset}...")
@@ -206,6 +215,12 @@ def run_sentry():
             if not markets_batch:
                 break
             all_live_markets.extend(markets_batch)
+            pages += 1
+            if len(markets_batch) < limit:
+                break
+            if pages >= max_pages:
+                sentry_logger.warning(f"Reached SENTRY_MAX_PAGES={max_pages}; stopping scan early.")
+                break
             offset += limit
             jitter_sleep(1.0, 5.0)
 
@@ -213,16 +228,18 @@ def run_sentry():
         
         # Apply "Relaxed Filters"
         new_markets_to_add = []
+        seen_market_ids = set(existing_market_ids)
         for market in all_live_markets:
             market_id = market.get("id")
             if not market_id:
                 continue
 
             # Check if it's new
-            if market_id not in existing_market_ids:
+            if market_id not in seen_market_ids:
                 # Check filters: Active and Volume > $2000
-                if market.get("closed") == False and market.get("volumeNum", 0) > 2000:
+                if market.get("closed") is False and _safe_float(market.get("volumeNum", 0)) > 2000:
                     new_markets_to_add.append(market)
+                    seen_market_ids.add(market_id)
 
         if not new_markets_to_add:
             sentry_logger.info("No new markets found matching criteria.")
@@ -277,7 +294,7 @@ def run_predictor():
 
 # --- 5. Scheduler Setup ---
 if __name__ == "__main__":
-    root_logger.info("Initializing Gemini Backend Service...")
+    system_logger.info("Initializing Gemini Backend Service...")
     download_db()
     
     scheduler = BackgroundScheduler(timezone="UTC")
@@ -295,21 +312,21 @@ if __name__ == "__main__":
     scheduler.add_job(run_predictor, 'interval', hours=1)
     
     scheduler.start()
-    root_logger.info("Scheduler started. Jobs are now running on their respective intervals.")
+    system_logger.info("Scheduler started. Jobs are now running on their respective intervals.")
     
     # Initial "catch-up" runs on startup
-    root_logger.info("Performing initial catch-up runs...")
+    system_logger.info("Performing initial catch-up runs...")
     run_sentry()
     run_tracker()
     run_social()
     run_predictor()
-    root_logger.info("Initial runs complete. Service is now in standard operation.")
+    system_logger.info("Initial runs complete. Service is now in standard operation.")
     
     try:
         # Keep the main thread alive
         while True:
             time.sleep(3600)
     except (KeyboardInterrupt, SystemExit):
-        root_logger.info("Shutting down Gemini Backend Service.")
+        system_logger.info("Shutting down Gemini Backend Service.")
         scheduler.shutdown()
 
