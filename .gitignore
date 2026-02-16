@@ -1,0 +1,21 @@
+.aider*
+
+# Local secrets
+.env
+
+# Virtual environments
+env/
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Runtime artifacts
+*.log
+*.db
+result.txt
+result_analyzer.txt
+predictions_latest.json
+shadow_pending.jsonl

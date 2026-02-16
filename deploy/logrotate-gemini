@@ -1,0 +1,9 @@
+/opt/gemini/gemini_system.log /opt/gemini/shadow_results.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
