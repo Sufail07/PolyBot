@@ -11,4 +11,3 @@ huggingface-hub
 scikit-learn
 vaderSentiment
 streamlit
-requests-toolbelt
