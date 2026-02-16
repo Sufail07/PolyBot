@@ -39,8 +39,8 @@ def ensure_backend_worker():
     process = subprocess.Popen(
         [sys.executable, str(ROOT_DIR / "backend.py")],
         cwd=str(ROOT_DIR),
-        stdout=subprocess.STDOUT,
-        stderr=subprocess.STDOUT,
+        stdout=None,
+        stderr=None,
         env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
     return process, "stdout/stderr (HF runtime logs)"
