@@ -2,10 +2,50 @@ from sqlalchemy import create_engine, Column, String, DateTime, Float, Text, Int
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.ext.declarative import declarative_base
 import datetime
+import os
+from huggingface_hub import HfApi, hf_hub_download
 
-DATABASE_URL = "sqlite:///./polymarket.db"
+
+
 
 Base = declarative_base()
+
+DATABASE_URL = "sqlite:///./polymarket.db"
+REPO_ID = "Sufail07/PolyBot"
+DB_NAME = "polymarket.db"
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+def download_db():
+    """Downloads the database from the HF Dataset at startup"""
+    try:
+        path = hf_hub_download(
+            repo_id=REPO_ID,
+            filename=DB_NAME,
+            repo_type="dataset",
+            token=HF_TOKEN
+        )
+        # Move the downloaded file to the current working directory
+        import shutil
+        shutil.copy(path, DB_NAME)
+        print("✅ Database synced from HF Dataset.")
+    except Exception as e:
+        print(f"ℹ️ No existing database found in dataset, starting fresh. ({e})")
+
+def upload_db():
+    """Uploads the current database to the HF Dataset"""
+    try:
+        api = HfApi()
+        api.upload_file(
+            path_or_fileobj=DB_NAME,
+            path_in_repo=DB_NAME,
+            repo_id=REPO_ID,
+            repo_type="dataset",
+            token=HF_TOKEN
+        )
+        print("☁️ Database backed up to HF Dataset.")
+    except Exception as e:
+        print(f"❌ Backup failed: {e}")
+
 
 class Market(Base):
     __tablename__ = "markets"

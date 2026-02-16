@@ -1,15 +1,23 @@
 import logging
 import time
 import json
+import os
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from database import SessionLocal, Market, MarketSnapshot
+from database import SessionLocal, Market, MarketSnapshot, download_db, upload_db
 from polymarket_scraper import fetch_markets, store_markets
 from social_monitor import run_social_monitor
 from signal_predictor import run_predictor_cycle
 from http_utils import request_with_retry, jitter_sleep
+import nltk
+import sys
+# This forces Python to print immediately rather than waiting
+sys.stdout.reconfigure(line_buffering=True)
+
+nltk.download('vader_lexicon')
+nltk.download('stopwords')
 
 # --- 1. Logging Setup ---
 # Custom formatter to add a gear name to the logs
@@ -168,6 +176,7 @@ def run_tracker():
         
         db.commit()
         tracker_logger.info("Snapshot capture complete.")
+        upload_db()
 
     except Exception as e:
         tracker_logger.error(f"An unexpected error occurred in the tracker: {e}")
@@ -228,6 +237,9 @@ def run_sentry():
         for market_data in new_markets_to_add:
             create_baseline_snapshot(market_data['id'], db)
 
+        upload_db() 
+        sentry_logger.info("Database backed up after Sentry run.")
+
     except Exception as e:
         sentry_logger.error(f"An unexpected error occurred in the sentry: {e}", exc_info=True)
         db.rollback()
@@ -241,6 +253,7 @@ def run_social():
     db = SessionLocal()
     try:
         run_social_monitor(db=db, logger=social_logger)
+        upload_db()
     except Exception as e:
         social_logger.error(f"An unexpected error occurred in social monitor: {e}", exc_info=True)
         db.rollback()
@@ -254,6 +267,7 @@ def run_predictor():
     db = SessionLocal()
     try:
         run_predictor_cycle(db=db, logger=predictor_logger, retrain_every_hours=12)
+        upload_db()
     except Exception as e:
         predictor_logger.error(f"An unexpected error occurred in predictor: {e}", exc_info=True)
         db.rollback()
@@ -264,6 +278,7 @@ def run_predictor():
 # --- 5. Scheduler Setup ---
 if __name__ == "__main__":
     root_logger.info("Initializing Gemini Backend Service...")
+    download_db()
     
     scheduler = BackgroundScheduler(timezone="UTC")
     
