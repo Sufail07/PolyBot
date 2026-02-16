@@ -1,6 +1,7 @@
 import os
 import logging
 import sys
+import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -25,6 +26,25 @@ def _mask(value: str, keep: int = 4) -> str:
     if len(value) <= keep:
         return "*" * len(value)
     return "*" * (len(value) - keep) + value[-keep:]
+
+
+@st.cache_resource
+def ensure_backend_worker():
+    """
+    Start backend.py once per Streamlit process so ingestion runs continuously.
+    """
+    if os.getenv("DISABLE_BACKGROUND_BACKEND", "0") == "1":
+        return None, "disabled"
+
+    log_path = ROOT_DIR / "backend_worker.log"
+    log_file = open(log_path, "a", encoding="utf-8")
+    process = subprocess.Popen(
+        [sys.executable, str(ROOT_DIR / "backend.py")],
+        cwd=str(ROOT_DIR),
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    return process, str(log_path)
 
 
 def _send_telegram_message(text: str) -> tuple[bool, str]:
@@ -175,6 +195,14 @@ def startup_telegram_check() -> dict:
 
 st.set_page_config(page_title="Polymarket Bot Monitor", page_icon=":satellite:", layout="centered")
 st.title("Polymarket Bot Monitor")
+
+backend_proc, backend_log = ensure_backend_worker()
+if backend_proc is None:
+    st.warning("Background backend worker is disabled (DISABLE_BACKGROUND_BACKEND=1).")
+elif backend_proc.poll() is None:
+    st.caption(f"Backend worker: running (pid={backend_proc.pid}) | log: {backend_log}")
+else:
+    st.error(f"Backend worker exited (code={backend_proc.returncode}). Check {backend_log}.")
 
 status = startup_telegram_check()
 st.caption(f"Startup Telegram check: {'OK' if status['ok'] else 'FAILED'}")
