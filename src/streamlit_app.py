@@ -36,15 +36,14 @@ def ensure_backend_worker():
     if os.getenv("DISABLE_BACKGROUND_BACKEND", "0") == "1":
         return None, "disabled"
 
-    log_path = ROOT_DIR / "backend_worker.log"
-    log_file = open(log_path, "a", encoding="utf-8")
     process = subprocess.Popen(
         [sys.executable, str(ROOT_DIR / "backend.py")],
         cwd=str(ROOT_DIR),
-        stdout=log_file,
+        stdout=subprocess.STDOUT,
         stderr=subprocess.STDOUT,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
-    return process, str(log_path)
+    return process, "stdout/stderr (HF runtime logs)"
 
 
 def _send_telegram_message(text: str) -> tuple[bool, str]:
