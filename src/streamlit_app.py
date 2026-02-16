@@ -1,10 +1,16 @@
 import os
 import logging
+import sys
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import requests
 import streamlit as st
 from sqlalchemy import desc
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from database import Market, ProcessedSubmission, SessionLocal, SocialSignal
 from social_monitor import _parse_google_news_rss, clean_market_query
