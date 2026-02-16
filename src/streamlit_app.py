@@ -2,6 +2,7 @@ import os
 import logging
 import sys
 import subprocess
+import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -13,11 +14,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from database import Market, ProcessedSubmission, SessionLocal, SocialSignal
+from database import Market, MarketSnapshot, ProcessedSubmission, SessionLocal, SocialSignal
 from social_monitor import _parse_google_news_rss, clean_market_query
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telegram-check")
+PREDICTIONS_PATH = ROOT_DIR / "predictions_latest.json"
+SHADOW_RESULTS_PATH = ROOT_DIR / "shadow_results.log"
 
 
 def _mask(value: str, keep: int = 4) -> str:
@@ -80,6 +83,98 @@ def _fmt_dt(value: datetime | None) -> str:
         return value.astimezone(timezone.utc).isoformat()
     except Exception:
         return str(value)
+
+
+@st.cache_data(ttl=30)
+def get_market_runtime_health() -> dict:
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        ten_min_ago = now - timedelta(minutes=10)
+        one_hour_ago = now - timedelta(hours=1)
+
+        total_markets = db.query(Market).count()
+        latest_snapshot = db.query(MarketSnapshot).order_by(desc(MarketSnapshot.timestamp)).first()
+        latest_signal = db.query(SocialSignal).order_by(desc(SocialSignal.timestamp)).first()
+        snapshots_last_10m = db.query(MarketSnapshot).filter(MarketSnapshot.timestamp >= ten_min_ago).count()
+        snapshots_last_hour = db.query(MarketSnapshot).filter(MarketSnapshot.timestamp >= one_hour_ago).count()
+        signals_last_hour = db.query(SocialSignal).filter(SocialSignal.timestamp >= one_hour_ago).count()
+
+        recent_snapshots = (
+            db.query(MarketSnapshot)
+            .order_by(desc(MarketSnapshot.timestamp))
+            .limit(10)
+            .all()
+        )
+
+        recent_rows = [
+            {
+                "market_id": s.market_id,
+                "snapshot_utc": _fmt_dt(s.timestamp),
+                "probability": float(s.probability or 0.0),
+                "volume": float(s.volume or 0.0),
+            }
+            for s in recent_snapshots
+        ]
+
+        return {
+            "ok": True,
+            "total_markets_tracked": total_markets,
+            "latest_snapshot_utc": _fmt_dt(getattr(latest_snapshot, "timestamp", None)),
+            "latest_signal_utc": _fmt_dt(getattr(latest_signal, "timestamp", None)),
+            "snapshots_last_10m": snapshots_last_10m,
+            "snapshots_last_hour": snapshots_last_hour,
+            "signals_last_hour": signals_last_hour,
+            "recent_snapshots": recent_rows,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
+
+
+@st.cache_data(ttl=30)
+def get_latest_predictions() -> dict:
+    if not PREDICTIONS_PATH.exists():
+        return {"ok": False, "error": "predictions_latest.json not found yet"}
+    try:
+        with open(PREDICTIONS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        top = data.get("top_predictions", [])[:10]
+        table = [
+            {
+                "market_id": p.get("market_id"),
+                "pred_surge_prob": round(float(p.get("predicted_surge_probability", 0.0)), 4),
+                "latest_weighted_score": round(float(p.get("latest_weighted_score", 0.0)), 3),
+                "latest_raw_count": int(p.get("latest_raw_count", 0)),
+                "base_probability": round(float(p.get("base_probability", 0.0)), 4),
+                "prediction_time": p.get("prediction_time"),
+            }
+            for p in top
+        ]
+        return {
+            "ok": True,
+            "generated_at": data.get("generated_at", "n/a"),
+            "model": data.get("model", "ml"),
+            "rows": table,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@st.cache_data(ttl=30)
+def get_shadow_evaluations(last_n: int = 20) -> list[dict]:
+    if not SHADOW_RESULTS_PATH.exists():
+        return []
+    rows = []
+    try:
+        with open(SHADOW_RESULTS_PATH, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+        for line in lines[-last_n:]:
+            rows.append({"evaluation": line})
+        return rows[::-1]
+    except Exception:
+        return []
 
 
 @st.cache_data(ttl=60)
@@ -220,6 +315,35 @@ if st.button("Send Telegram test message"):
     else:
         st.error(detail)
 
+st.subheader("Live Operations")
+runtime = get_market_runtime_health()
+if not runtime.get("ok"):
+    st.error(f"Runtime health unavailable: {runtime.get('error', 'unknown error')}")
+else:
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Tracked Markets", runtime["total_markets_tracked"])
+    col2.metric("Snapshots (10m)", runtime["snapshots_last_10m"])
+    col3.metric("Signals (1h)", runtime["signals_last_hour"])
+    st.caption(
+        f"Latest snapshot: {runtime['latest_snapshot_utc']} | Latest signal: {runtime['latest_signal_utc']}"
+    )
+    st.caption("Recent market snapshots")
+    st.dataframe(runtime["recent_snapshots"], width="stretch")
+
+st.subheader("Latest Evaluation")
+preds = get_latest_predictions()
+if not preds.get("ok"):
+    st.warning(preds.get("error", "Prediction output not ready yet"))
+else:
+    st.caption(f"Predictions generated at: {preds['generated_at']} | Model: {preds['model']}")
+    st.dataframe(preds["rows"], width="stretch")
+    shadow_rows = get_shadow_evaluations(last_n=20)
+    st.caption("Recent shadow evaluation results")
+    if shadow_rows:
+        st.dataframe(shadow_rows, width="stretch")
+    else:
+        st.write("No shadow evaluation rows yet.")
+
 st.subheader("Source Health")
 source_health = get_source_health()
 if not source_health.get("ok"):
@@ -228,12 +352,12 @@ else:
     st.json(source_health["google_rss"])
     st.json(source_health["social_signals"])
     st.caption("Recent social signal rows")
-    st.dataframe(source_health["recent_signals"], use_container_width=True)
+    st.dataframe(source_health["recent_signals"], width="stretch")
 
 if st.button("Run Google RSS probe now"):
     ok, detail, rows = probe_google_rss(limit=5)
     if ok:
         st.success(detail)
-        st.dataframe(rows, use_container_width=True)
+        st.dataframe(rows, width="stretch")
     else:
         st.warning(detail)
