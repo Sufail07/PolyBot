@@ -2,22 +2,35 @@ import logging
 import time
 import json
 import os
+import re
+import sys
+from pathlib import Path
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from apscheduler.schedulers.background import BackgroundScheduler
+
+# Ensure local modules are importable regardless of launch directory.
+ROOT_DIR = Path(__file__).resolve().parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from database import SessionLocal, Market, MarketSnapshot, download_db, upload_db
 from polymarket_scraper import fetch_markets, store_markets
 from social_monitor import run_social_monitor
 from signal_predictor import run_predictor_cycle
+from latency_analyzer import run_latency_analysis
 from http_utils import request_with_retry, jitter_sleep
-import nltk
-import sys
 # This forces Python to print immediately rather than waiting
 sys.stdout.reconfigure(line_buffering=True)
 
-nltk.download('vader_lexicon')
-nltk.download('stopwords')
+try:
+    import nltk
+except ImportError:
+    nltk = None
+
+if nltk is not None:
+    nltk.download('vader_lexicon')
+    nltk.download('stopwords')
 
 # --- 1. Logging Setup ---
 # Custom formatter to add a gear name to the logs
@@ -91,10 +104,20 @@ predictor_logger.propagate = False
 
 # Polymarket API base URL for a single market
 POLIMARKET_SINGLE_MARKET_API_URL = "https://gamma-api.polymarket.com/markets/{}"
+MARKET_ID_PATTERN = re.compile(r"^\d+$")
+
+def is_valid_market_id(market_id: str) -> bool:
+    if market_id is None:
+        return False
+    return bool(MARKET_ID_PATTERN.fullmatch(str(market_id).strip()))
+
 
 # --- 2. Helper Functions ---
 def fetch_single_market_data(market_id: str):
     """Fetches real-time data for a single market."""
+    if not is_valid_market_id(market_id):
+        system_logger.warning("Invalid market_id '%s' for single-market endpoint.", market_id)
+        return None
     try:
         response = request_with_retry(
             "GET",
@@ -164,6 +187,9 @@ def run_tracker():
         tracker_logger.info(f"Tracking {len(market_ids)} markets.")
 
         for market_id in market_ids:
+            if not is_valid_market_id(market_id):
+                tracker_logger.warning(f"Skipping invalid market_id '{market_id}'.")
+                continue
             market_data = fetch_single_market_data(market_id)
             if not market_data:
                 tracker_logger.warning(f"Could not fetch data for market {market_id}. Skipping.")
@@ -284,6 +310,7 @@ def run_predictor():
     db = SessionLocal()
     try:
         run_predictor_cycle(db=db, logger=predictor_logger, retrain_every_hours=12)
+        run_latency_analysis(db=db, logger=predictor_logger)
         upload_db()
     except Exception as e:
         predictor_logger.error(f"An unexpected error occurred in predictor: {e}", exc_info=True)

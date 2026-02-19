@@ -16,6 +16,7 @@ from database import Market, MarketSnapshot, SessionLocal, SocialSignal
 MODEL_PATH = "model_weights.json"
 SHADOW_PENDING_PATH = "shadow_pending.jsonl"
 SHADOW_RESULTS_PATH = "shadow_results.log"
+SHADOW_SUMMARY_PATH = "shadow_summary.json"
 ALERT_STATE_PATH = "alert_state.json"
 
 
@@ -34,6 +35,25 @@ def _safe_float(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _env_float(name: str, default: float) -> float:
+    return _safe_float(os.getenv(name, default), default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _liquidity_bucket(volume: float) -> str:
+    if volume < 10_000:
+        return "low"
+    if volume < 100_000:
+        return "mid"
+    return "high"
 
 
 def _sigmoid(x):
@@ -658,6 +678,11 @@ def predict_current_markets(db: Session, logger: logging.Logger, top_n: int = 20
                 "latest_weighted_score": float(signal.weighted_score or 0.0),
                 "prediction_time": prediction_time,
                 "base_probability": float(current_snap.probability or 0.0),
+                "category": market.category or "Unknown",
+                "volume": _safe_float(market.volume, 0.0),
+                "liquidity_bucket": _liquidity_bucket(_safe_float(market.volume, 0.0)),
+                "bid_ask_spread": _safe_float(market.bid_ask_spread, 0.0),
+                "model": "ml",
             }
         )
 
@@ -761,6 +786,10 @@ def predict_current_markets_heuristic(db: Session, logger: logging.Logger, top_n
                 "prediction_time": now_iso,
                 "base_probability": float(latest_snap.probability or 0.0) if latest_snap else 0.0,
                 "high_conviction_alert": high_conviction,
+                "category": market.category or "Unknown",
+                "volume": _safe_float(market.volume, 0.0),
+                "liquidity_bucket": _liquidity_bucket(_safe_float(market.volume, 0.0)),
+                "bid_ask_spread": _safe_float(market.bid_ask_spread, 0.0),
                 "model": "heuristic",
             }
         )
@@ -802,11 +831,169 @@ def _append_shadow_pending(predictions: List[dict], horizon_hours: int):
                 "due_time": due.isoformat(),
                 "predicted_prob": p.get("predicted_surge_probability", 0.0),
                 "base_probability": p.get("base_probability", 0.0),
+                "category": p.get("category", "Unknown"),
+                "volume": p.get("volume", 0.0),
+                "liquidity_bucket": p.get("liquidity_bucket", "unknown"),
+                "bid_ask_spread": p.get("bid_ask_spread", 0.0),
+                "model": p.get("model", "unknown"),
                 "evaluated": False,
             }
         )
         keys.add(key)
     _write_jsonl(SHADOW_PENDING_PATH, existing)
+
+
+def _segment_metrics(rows: List[dict]) -> dict:
+    count = len(rows)
+    if count == 0:
+        return {
+            "count": 0,
+            "gross_edge_mean": None,
+            "net_edge_mean": None,
+            "gross_hit_rate": None,
+            "net_hit_rate": None,
+            "net_edge_std": None,
+            "net_edge_p25": None,
+            "net_edge_p75": None,
+            "net_edge_worst_decile_mean": None,
+        }
+
+    gross = [_safe_float(r.get("actual_move")) for r in rows]
+    net = [_safe_float(r.get("net_move")) for r in rows]
+    net_sorted = sorted(net)
+    worst_n = max(1, int(np.ceil(0.10 * len(net_sorted))))
+    return {
+        "count": count,
+        "gross_edge_mean": float(np.mean(gross)) if gross else 0.0,
+        "net_edge_mean": float(np.mean(net)) if net else 0.0,
+        "gross_hit_rate": float(np.mean([1 if x > 0 else 0 for x in gross])) if gross else 0.0,
+        "net_hit_rate": float(np.mean([1 if x > 0 else 0 for x in net])) if net else 0.0,
+        "net_edge_std": float(np.std(net)) if net else 0.0,
+        "net_edge_p25": float(np.quantile(net, 0.25)) if net else 0.0,
+        "net_edge_p75": float(np.quantile(net, 0.75)) if net else 0.0,
+        "net_edge_worst_decile_mean": float(np.mean(net_sorted[:worst_n])) if net_sorted else 0.0,
+    }
+
+
+def _write_shadow_summary(pending_rows: List[dict], logger: logging.Logger):
+    evaluated = [r for r in pending_rows if r.get("evaluated") and r.get("actual_move") is not None]
+    if not evaluated:
+        return
+
+    by_category = {}
+    by_liquidity = {}
+    by_month = {}
+
+    category_map = {}
+    liquidity_map = {}
+    month_map = {}
+
+    for row in evaluated:
+        cat = row.get("category") or "Unknown"
+        liq = row.get("liquidity_bucket") or "unknown"
+        pred_time = row.get("prediction_time") or ""
+        month = pred_time[:7] if len(pred_time) >= 7 else "unknown"
+
+        category_map.setdefault(cat, []).append(row)
+        liquidity_map.setdefault(liq, []).append(row)
+        month_map.setdefault(month, []).append(row)
+
+    for k, v in category_map.items():
+        by_category[k] = _segment_metrics(v)
+    for k, v in liquidity_map.items():
+        by_liquidity[k] = _segment_metrics(v)
+    for k, v in month_map.items():
+        by_month[k] = _segment_metrics(v)
+
+    overall = _segment_metrics(evaluated)
+
+    min_segment_n = _env_int("FEASIBILITY_MIN_SEGMENT_N", 10)
+    min_net_edge = _env_float("FEASIBILITY_MIN_NET_EDGE", 0.0)
+    min_net_hit_rate = _env_float("FEASIBILITY_MIN_NET_HIT_RATE", 0.55)
+    min_positive_categories = _env_int("FEASIBILITY_MIN_POSITIVE_CATEGORIES", 2)
+    min_positive_month_ratio = _env_float("FEASIBILITY_MIN_POSITIVE_MONTH_RATIO", 0.6)
+
+    positive_categories = 0
+    for segment in by_category.values():
+        if (
+            segment["count"] >= min_segment_n
+            and segment["net_edge_mean"] is not None
+            and segment["net_edge_mean"] > 0
+        ):
+            positive_categories += 1
+
+    stable_months = 0
+    eligible_months = 0
+    for segment in by_month.values():
+        if segment["count"] < min_segment_n:
+            continue
+        eligible_months += 1
+        if segment["net_edge_mean"] is not None and segment["net_edge_mean"] > 0:
+            stable_months += 1
+    positive_month_ratio = (stable_months / eligible_months) if eligible_months else None
+    positive_liquidity_buckets = 0
+    for segment in by_liquidity.values():
+        if (
+            segment["count"] >= min_segment_n
+            and segment["net_edge_mean"] is not None
+            and segment["net_edge_mean"] > 0
+        ):
+            positive_liquidity_buckets += 1
+
+    freeze_days = _env_int("FEASIBILITY_FREEZE_DAYS", 30)
+    evaluated_times = []
+    for row in evaluated:
+        raw = row.get("evaluated_at")
+        if not raw:
+            continue
+        try:
+            evaluated_times.append(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+        except ValueError:
+            continue
+    first_evaluated_at = min(evaluated_times) if evaluated_times else None
+    freeze_end_at = (first_evaluated_at + timedelta(days=freeze_days)) if first_evaluated_at else None
+
+    gate = {
+        "name": "post_cost_edge_gate",
+        "min_net_edge": min_net_edge,
+        "min_net_hit_rate": min_net_hit_rate,
+        "min_positive_categories": min_positive_categories,
+        "min_positive_month_ratio": min_positive_month_ratio,
+        "actual_net_edge_mean": overall["net_edge_mean"],
+        "actual_net_hit_rate": overall["net_hit_rate"],
+        "actual_positive_categories": positive_categories,
+        "actual_positive_liquidity_buckets": positive_liquidity_buckets,
+        "actual_positive_month_ratio": positive_month_ratio,
+        "pass": (
+            overall["net_edge_mean"] is not None
+            and overall["net_hit_rate"] is not None
+            and overall["net_edge_mean"] >= min_net_edge
+            and overall["net_hit_rate"] >= min_net_hit_rate
+            and positive_categories >= min_positive_categories
+            and positive_month_ratio is not None
+            and positive_month_ratio >= min_positive_month_ratio
+        ),
+    }
+
+    summary = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "count_evaluated": len(evaluated),
+        "overall": overall,
+        "by_category": by_category,
+        "by_liquidity_bucket": by_liquidity,
+        "by_month": by_month,
+        "evaluation_policy": {
+            "freeze_days": freeze_days,
+            "first_evaluated_at": first_evaluated_at.isoformat() if first_evaluated_at else None,
+            "freeze_end_at": freeze_end_at.isoformat() if freeze_end_at else None,
+            "freeze_active": bool(freeze_end_at and datetime.now(timezone.utc) < freeze_end_at),
+            "note": "Do not retune thresholds during freeze window.",
+        },
+        "feasibility_gate": gate,
+    }
+    with open(SHADOW_SUMMARY_PATH, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    logger.info("Shadow summary updated. evaluated=%d net_edge=%.5f", len(evaluated), _safe_float(overall["net_edge_mean"]))
 
 
 def _evaluate_shadow_pending(db: Session, logger: logging.Logger, horizon_hours: int):
@@ -848,10 +1035,38 @@ def _evaluate_shadow_pending(db: Session, logger: logging.Logger, horizon_hours:
         predicted_label = 1 if predicted_prob >= 0.6 else 0
         actual_label = 1 if actual_move > 0 else 0
 
+        market_obj = (
+            db.query(Market)
+            .filter(Market.market_id == market_id)
+            .first()
+        )
+        category = row.get("category") or (market_obj.category if market_obj else "Unknown") or "Unknown"
+        volume = _safe_float(row.get("volume"), _safe_float(getattr(market_obj, "volume", 0.0)))
+        spread = _safe_float(row.get("bid_ask_spread"), _safe_float(getattr(market_obj, "bid_ask_spread", 0.0)))
+        liquidity_bucket = row.get("liquidity_bucket") or _liquidity_bucket(volume)
+
+        # Cost proxy in probability points for round-trip evaluation.
+        fee_bps = _env_float("SHADOW_FEE_BPS", 70.0)
+        slippage_multiplier = _env_float("SHADOW_SLIPPAGE_MULTIPLIER", 1.0)
+        avg_price = max(0.01, min(0.99, (base_prob + future_prob) / 2.0))
+        fee_points = (2.0 * fee_bps / 10_000.0) * avg_price
+        slippage_points = max(0.0, spread) * slippage_multiplier
+        total_cost_points = fee_points + slippage_points
+        net_move = actual_move - total_cost_points
+        actual_label_net = 1 if net_move > 0 else 0
+
         row["evaluated"] = True
         row["actual_move"] = actual_move
+        row["net_move"] = net_move
+        row["cost_points"] = total_cost_points
+        row["fee_points"] = fee_points
+        row["slippage_points"] = slippage_points
         row["predicted_label"] = predicted_label
         row["actual_label"] = actual_label
+        row["actual_label_net"] = actual_label_net
+        row["category"] = category
+        row["volume"] = volume
+        row["liquidity_bucket"] = liquidity_bucket
         row["evaluated_at"] = now.isoformat()
         updated.append(row)
 
@@ -859,7 +1074,8 @@ def _evaluate_shadow_pending(db: Session, logger: logging.Logger, horizon_hours:
             (
                 f"{now.isoformat()} | market={market_id} | pred_prob={predicted_prob:.3f} "
                 f"| base={base_prob:.4f} | future={future_prob:.4f} | move={actual_move:.4f} "
-                f"| pred_label={predicted_label} | actual_label={actual_label}"
+                f"| net_move={net_move:.4f} | cost={total_cost_points:.4f} "
+                f"| pred_label={predicted_label} | actual_label={actual_label} | actual_net={actual_label_net}"
             )
         )
 
@@ -869,6 +1085,7 @@ def _evaluate_shadow_pending(db: Session, logger: logging.Logger, horizon_hours:
             for line in result_lines:
                 f.write(line + "\n")
         logger.info("Shadow mode evaluated %d matured predictions.", len(result_lines))
+    _write_shadow_summary(updated, logger)
 
 
 def run_predictor_cycle(

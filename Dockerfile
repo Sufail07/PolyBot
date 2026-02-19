@@ -14,6 +14,7 @@ COPY backend.py ./backend.py
 COPY database.py ./database.py
 COPY social_monitor.py ./social_monitor.py
 COPY signal_predictor.py ./signal_predictor.py
+COPY latency_analyzer.py ./latency_analyzer.py
 COPY polymarket_scraper.py ./polymarket_scraper.py
 COPY http_utils.py ./http_utils.py
 

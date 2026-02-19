@@ -46,6 +46,21 @@ def request_with_retry(
                     attempt + 1,
                     max_retries,
                 )
+        except requests.HTTPError as exc:
+            response = exc.response
+            status = response.status_code if response is not None else None
+            # Fail fast on non-retryable client errors (e.g., 400/404/422).
+            if status is not None and status != 429 and 400 <= status < 500:
+                raise
+            if logger:
+                logger.warning(
+                    "HTTP request error for %s %s (attempt %d/%d): %s",
+                    method.upper(),
+                    url,
+                    attempt + 1,
+                    max_retries,
+                    exc,
+                )
         except requests.RequestException as exc:
             if logger:
                 logger.warning(

@@ -21,6 +21,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telegram-check")
 PREDICTIONS_PATH = ROOT_DIR / "predictions_latest.json"
 SHADOW_RESULTS_PATH = ROOT_DIR / "shadow_results.log"
+LATENCY_REPORT_PATH = ROOT_DIR / "latency_report.json"
+SHADOW_SUMMARY_PATH = ROOT_DIR / "shadow_summary.json"
 
 
 def _mask(value: str, keep: int = 4) -> str:
@@ -175,6 +177,61 @@ def get_shadow_evaluations(last_n: int = 20) -> list[dict]:
         return rows[::-1]
     except Exception:
         return []
+
+
+@st.cache_data(ttl=30)
+def get_latency_report() -> dict:
+    if not LATENCY_REPORT_PATH.exists():
+        return {"ok": False, "error": "latency_report.json not found yet"}
+    try:
+        with open(LATENCY_REPORT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {"ok": True, "data": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@st.cache_data(ttl=30)
+def get_shadow_summary() -> dict:
+    if not SHADOW_SUMMARY_PATH.exists():
+        return {"ok": False, "error": "shadow_summary.json not found yet"}
+    try:
+        with open(SHADOW_SUMMARY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {"ok": True, "data": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _segment_table(section: dict) -> list[dict]:
+    if not isinstance(section, dict):
+        return []
+    rows = []
+    for key, metrics in section.items():
+        rows.append(
+            {
+                "segment": key,
+                "count": int(metrics.get("count", 0) or 0),
+                "gross_edge_mean": round(float(metrics.get("gross_edge_mean", 0.0) or 0.0), 6)
+                if metrics.get("gross_edge_mean") is not None else None,
+                "net_edge_mean": round(float(metrics.get("net_edge_mean", 0.0) or 0.0), 6)
+                if metrics.get("net_edge_mean") is not None else None,
+                "gross_hit_rate": round(float(metrics.get("gross_hit_rate", 0.0) or 0.0), 4)
+                if metrics.get("gross_hit_rate") is not None else None,
+                "net_hit_rate": round(float(metrics.get("net_hit_rate", 0.0) or 0.0), 4)
+                if metrics.get("net_hit_rate") is not None else None,
+                "net_edge_std": round(float(metrics.get("net_edge_std", 0.0) or 0.0), 6)
+                if metrics.get("net_edge_std") is not None else None,
+                "net_edge_p25": round(float(metrics.get("net_edge_p25", 0.0) or 0.0), 6)
+                if metrics.get("net_edge_p25") is not None else None,
+                "net_edge_p75": round(float(metrics.get("net_edge_p75", 0.0) or 0.0), 6)
+                if metrics.get("net_edge_p75") is not None else None,
+                "net_edge_worst_decile_mean": round(float(metrics.get("net_edge_worst_decile_mean", 0.0) or 0.0), 6)
+                if metrics.get("net_edge_worst_decile_mean") is not None else None,
+            }
+        )
+    rows.sort(key=lambda r: r["count"], reverse=True)
+    return rows
 
 
 @st.cache_data(ttl=60)
@@ -343,6 +400,129 @@ else:
         st.dataframe(shadow_rows, width="stretch")
     else:
         st.write("No shadow evaluation rows yet.")
+
+st.subheader("Feasibility Stats")
+latency = get_latency_report()
+shadow_summary = get_shadow_summary()
+
+if not latency.get("ok"):
+    st.warning(latency.get("error", "Latency report unavailable"))
+else:
+    ldata = latency["data"]
+    lgate = ldata.get("feasibility_gate", {})
+    loverall = ldata.get("overall", {})
+    lcol1, lcol2, lcol3, lcol4 = st.columns(4)
+    lcol1.metric("Latency Gate", "PASS" if lgate.get("pass") else "FAIL")
+    lcol2.metric("Latency Events", int(loverall.get("count", 0) or 0))
+    lcol3.metric(
+        "Median 50% Adjust (min)",
+        "n/a" if loverall.get("median_time_to_50pct_adjust_minutes") is None
+        else round(float(loverall.get("median_time_to_50pct_adjust_minutes")), 2),
+    )
+    lcol4.metric(
+        "Median First Move (sec)",
+        "n/a" if loverall.get("median_time_to_first_move_seconds") is None
+        else round(float(loverall.get("median_time_to_first_move_seconds")), 2),
+    )
+    first_lag = loverall.get("median_first_move_lag_seconds")
+    st.caption(
+        "Signed first-move lag (sec): "
+        + ("n/a" if first_lag is None else str(round(float(first_lag), 2)))
+        + " (negative means price moved before social spike)"
+    )
+    st.caption(
+        "Latency gate: "
+        f"min_events={lgate.get('min_required_events')} | "
+        f"min_median_window_min={lgate.get('min_median_window_minutes')} | "
+        f"actual_median_window_min={lgate.get('actual_median_window_minutes')}"
+    )
+    st.caption("Latency by category")
+    st.dataframe(_segment_table(ldata.get("by_category", {})), width="stretch")
+    st.caption("Latency by liquidity bucket")
+    st.dataframe(_segment_table(ldata.get("by_liquidity_bucket", {})), width="stretch")
+
+if not shadow_summary.get("ok"):
+    st.warning(shadow_summary.get("error", "Shadow summary unavailable"))
+else:
+    sdata = shadow_summary["data"]
+    sgate = sdata.get("feasibility_gate", {})
+    soverall = sdata.get("overall", {})
+    scol1, scol2, scol3, scol4 = st.columns(4)
+    scol1.metric("Post-Cost Gate", "PASS" if sgate.get("pass") else "FAIL")
+    scol2.metric("Evaluated", int(sdata.get("count_evaluated", 0) or 0))
+    scol3.metric(
+        "Net Edge Mean",
+        "n/a" if soverall.get("net_edge_mean") is None else round(float(soverall.get("net_edge_mean")), 6),
+    )
+    scol4.metric(
+        "Net Hit Rate",
+        "n/a" if soverall.get("net_hit_rate") is None else round(float(soverall.get("net_hit_rate")), 4),
+    )
+    dcol1, dcol2, dcol3, dcol4 = st.columns(4)
+    dcol1.metric(
+        "Net Edge Std",
+        "n/a" if soverall.get("net_edge_std") is None else round(float(soverall.get("net_edge_std")), 6),
+    )
+    dcol2.metric(
+        "Net Edge P25",
+        "n/a" if soverall.get("net_edge_p25") is None else round(float(soverall.get("net_edge_p25")), 6),
+    )
+    dcol3.metric(
+        "Net Edge P75",
+        "n/a" if soverall.get("net_edge_p75") is None else round(float(soverall.get("net_edge_p75")), 6),
+    )
+    dcol4.metric(
+        "Worst Decile Mean",
+        "n/a" if soverall.get("net_edge_worst_decile_mean") is None else round(float(soverall.get("net_edge_worst_decile_mean")), 6),
+    )
+    st.caption(
+        "Post-cost gate: "
+        f"min_net_edge={sgate.get('min_net_edge')} | "
+        f"min_net_hit_rate={sgate.get('min_net_hit_rate')} | "
+        f"min_positive_categories={sgate.get('min_positive_categories')} | "
+        f"min_positive_month_ratio={sgate.get('min_positive_month_ratio')}"
+    )
+    st.caption("Shadow performance by category")
+    st.dataframe(_segment_table(sdata.get("by_category", {})), width="stretch")
+    st.caption("Shadow performance by liquidity bucket")
+    st.dataframe(_segment_table(sdata.get("by_liquidity_bucket", {})), width="stretch")
+    st.caption("Shadow performance by month")
+    st.dataframe(_segment_table(sdata.get("by_month", {})), width="stretch")
+
+    st.caption("Red flags")
+    red_flags = []
+    if first_lag is not None and float(first_lag) < 0:
+        red_flags.append("A: Social follows price (median signed first-move lag < 0s).")
+
+    positive_cats = int(sgate.get("actual_positive_categories", 0) or 0)
+    positive_liq = int(sgate.get("actual_positive_liquidity_buckets", 0) or 0)
+    if positive_cats <= 1 or positive_liq <= 1:
+        red_flags.append(
+            "B: Edge appears concentrated in a tiny slice. Treat as specialization, not generalization."
+        )
+
+    gross_edge = soverall.get("gross_edge_mean")
+    net_edge = soverall.get("net_edge_mean")
+    if gross_edge is not None and net_edge is not None and float(gross_edge) > 0 and float(net_edge) <= 0:
+        red_flags.append("C: Edge disappears after costs (gross positive, net non-positive).")
+
+    if red_flags:
+        for item in red_flags:
+            st.error(item)
+    else:
+        st.success("No major red flags triggered by current feasibility diagnostics.")
+
+    policy = sdata.get("evaluation_policy", {})
+    if policy.get("freeze_active"):
+        st.warning(
+            "Threshold freeze active: do not retune filters/thresholds during this window. "
+            f"Freeze ends at {policy.get('freeze_end_at')}."
+        )
+    else:
+        st.info(
+            "Threshold freeze recommendation: keep rules fixed for a full evaluation window "
+            "(default 30 days) to avoid data snooping."
+        )
 
 st.subheader("Source Health")
 source_health = get_source_health()
